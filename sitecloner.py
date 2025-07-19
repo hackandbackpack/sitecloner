@@ -368,12 +368,16 @@ class SiteCloner:
         max_iterations = 10  # Increased but still bounded
         max_total_css_files = 500  # Prevent processing too many CSS files
         max_css_depth = 8  # Track import depth to prevent deep recursion
+        max_total_imports = 2000  # Total import limit to prevent exponential growth
+        max_imports_per_file = 50  # Limit imports per CSS file
+        max_css_file_size = 10 * 1024 * 1024  # 10MB limit per CSS file
         iteration = 0
         
         # Track CSS import chains to detect cycles
         css_import_graph = {}  # url -> set of imported urls
         processed_css_files = set()  # Track which CSS files we've already processed
         css_depth_tracker = {}  # url -> depth level
+        total_imports_count = 0  # Track total imports to prevent bombs
         
         while iteration < max_iterations:
             iteration += 1
@@ -406,8 +410,9 @@ class SiteCloner:
                     processed_css_files.add(css_url)
                     
                     # Check file size before processing
-                    if css_path.stat().st_size > 10 * 1024 * 1024:  # 10MB limit
-                        self.logger.warning(f"Skipping large CSS file {css_path} ({css_path.stat().st_size} bytes)")
+                    file_size = css_path.stat().st_size
+                    if file_size > max_css_file_size:
+                        self.logger.warning(f"Skipping large CSS file {css_path} ({file_size} bytes)")
                         continue
                     
                     # Use proper encoding detection for CSS files
@@ -421,8 +426,20 @@ class SiteCloner:
                     
                     # Track imports for cycle detection
                     imported_css_urls = set()
-                    if 'css' in css_assets:
-                        imported_css_urls = css_assets['css']
+                    if 'stylesheets' in css_assets:
+                        imported_css_urls = css_assets['stylesheets']
+                        
+                        # Check import limits per file
+                        if len(imported_css_urls) > max_imports_per_file:
+                            self.logger.warning(f"CSS file {css_url} has {len(imported_css_urls)} imports, limiting to {max_imports_per_file}")
+                            imported_css_urls = set(list(imported_css_urls)[:max_imports_per_file])
+                        
+                        # Check total import limit
+                        total_imports_count += len(imported_css_urls)
+                        if total_imports_count > max_total_imports:
+                            self.logger.warning(f"Reached total CSS import limit ({max_total_imports}), stopping CSS processing")
+                            break
+                        
                         css_import_graph[css_url] = imported_css_urls
                         
                         # Check for import cycles
@@ -488,7 +505,7 @@ class SiteCloner:
         if iteration >= max_iterations:
             self.logger.warning(f"Reached maximum CSS processing iterations ({max_iterations})")
         
-        self.logger.info(f"CSS processing completed: {len(processed_css_files)} files processed, max depth: {max(css_depth_tracker.values()) if css_depth_tracker else 0}")
+        self.logger.info(f"CSS processing completed: {len(processed_css_files)} files processed, {total_imports_count} total imports, max depth: {max(css_depth_tracker.values()) if css_depth_tracker else 0}")
     
     def _has_css_import_cycle(self, start_url: str, import_graph: dict, visited: set = None, path: set = None) -> bool:
         """Detect cycles in CSS import chains using DFS."""

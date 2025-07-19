@@ -11,6 +11,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from url_resolver import URLResolver
+from url_trie import URLTrie
 
 
 class URLRewriter:
@@ -22,6 +23,9 @@ class URLRewriter:
         
         # URL mapping: original_url -> local_path_relative
         self.url_mapping: Dict[str, str] = {}
+        
+        # Trie for efficient URL lookups
+        self.url_trie = URLTrie()
         
         # HTML attributes that contain URLs and should be rewritten
         self.rewrite_attributes = {
@@ -43,9 +47,13 @@ class URLRewriter:
             # Convert to URL-style path with forward slashes
             local_url = str(relative_path).replace('\\', '/')
             self.url_mapping[original_url] = local_url
+            
+            # Also add to Trie for efficient lookups
+            self.url_trie.insert(original_url, local_path, {'relative_url': local_url})
         except ValueError:
             # If relative_to fails, just use the filename
             self.url_mapping[original_url] = local_path.name
+            self.url_trie.insert(original_url, local_path, {'relative_url': local_path.name})
     
     def add_url_mappings_from_dict(self, mappings: Dict[str, Path], output_dir: Path):
         """Add multiple URL mappings from a dictionary."""
@@ -171,8 +179,19 @@ class URLRewriter:
         # First, try to resolve the URL to get the canonical form
         resolved_url = self.url_resolver.resolve_url(url)
         
-        if resolved_url and resolved_url in self.url_mapping:
+        # Use Trie for efficient lookup
+        local_path = None
+        if resolved_url:
+            trie_result = self.url_trie.search(resolved_url)
+            if trie_result:
+                _, _, metadata = trie_result
+                local_path = metadata.get('relative_url')
+        
+        # Fallback to dictionary lookup for backward compatibility
+        if not local_path and resolved_url and resolved_url in self.url_mapping:
             local_path = self.url_mapping[resolved_url]
+        
+        if local_path:
             
             # Calculate relative path from current page to the asset
             local_path_obj = Path(local_path)

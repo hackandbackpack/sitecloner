@@ -12,9 +12,103 @@ import mimetypes
 import chardet
 import psutil
 import shutil
+import socket
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor
 
 from config import SiteClonerConfig
 from url_resolver import URLResolver
+from auth_strategies import AuthStrategy, NoAuthStrategy, AuthStrategyFactory
+from progress_observers import ProgressSubject
+
+
+class DNSValidator:
+    """Validates DNS resolutions to prevent DNS rebinding attacks."""
+    
+    def __init__(self):
+        self.cache = {}
+        self.lock = asyncio.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        
+        # Private IP ranges to block
+        self.private_networks = [
+            ipaddress.ip_network('10.0.0.0/8'),
+            ipaddress.ip_network('172.16.0.0/12'),
+            ipaddress.ip_network('192.168.0.0/16'),
+            ipaddress.ip_network('127.0.0.0/8'),
+            ipaddress.ip_network('169.254.0.0/16'),  # Link-local
+            ipaddress.ip_network('::1/128'),  # IPv6 loopback
+            ipaddress.ip_network('fc00::/7'),  # IPv6 private
+            ipaddress.ip_network('fe80::/10'),  # IPv6 link-local
+        ]
+    
+    def _resolve_hostname_sync(self, hostname: str) -> Set[str]:
+        """Synchronously resolve hostname to IP addresses."""
+        try:
+            # Get all IP addresses for hostname
+            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC)
+            ips = set()
+            for info in addr_info:
+                ip_str = info[4][0]
+                ips.add(ip_str)
+            return ips
+        except (socket.gaierror, OSError):
+            return set()
+    
+    async def resolve_and_validate(self, hostname: str) -> bool:
+        """Resolve hostname and validate it's not pointing to private IPs."""
+        async with self.lock:
+            # Check cache
+            if hostname in self.cache:
+                return self.cache[hostname]
+        
+        # Resolve in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        ips = await loop.run_in_executor(self.executor, self._resolve_hostname_sync, hostname)
+        
+        # Validate all resolved IPs
+        is_valid = True
+        for ip_str in ips:
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                
+                # Check if IP is private or reserved
+                if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
+                    is_valid = False
+                    break
+                
+                # Check against our private networks
+                for network in self.private_networks:
+                    if ip in network:
+                        is_valid = False
+                        break
+                
+                if not is_valid:
+                    break
+                    
+            except ValueError:
+                # Invalid IP address
+                is_valid = False
+                break
+        
+        # Cache result for 5 minutes
+        async with self.lock:
+            self.cache[hostname] = is_valid
+        
+        # Schedule cache cleanup
+        asyncio.create_task(self._cleanup_cache_entry(hostname))
+        
+        return is_valid
+    
+    async def _cleanup_cache_entry(self, hostname: str):
+        """Remove cache entry after 5 minutes."""
+        await asyncio.sleep(300)  # 5 minutes
+        async with self.lock:
+            self.cache.pop(hostname, None)
+    
+    def close(self):
+        """Cleanup resources."""
+        self.executor.shutdown(wait=False)
 
 
 class DownloadResult:
@@ -86,6 +180,15 @@ class DownloadManager:
         self.auth_headers: Dict[str, str] = {}
         self.rate_limiter = RateLimiter(max_requests_per_second=self.config.max_concurrent_downloads)
         
+        # DNS validator to prevent DNS rebinding attacks
+        self.dns_validator = DNSValidator()
+        
+        # Authentication strategy
+        self.auth_strategy: AuthStrategy = NoAuthStrategy()
+        
+        # Progress tracking
+        self.progress_subject = ProgressSubject()
+        
     def set_progress_callback(self, callback: Callable[[str, int, int], None]):
         """Set callback for progress updates. Called with (url, downloaded, total)."""
         self.progress_callback = callback
@@ -124,7 +227,7 @@ class DownloadManager:
         )
         
         # Prepare session headers
-        session_headers = {
+        base_headers = {
             'User-Agent': self.config.user_agent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
@@ -132,9 +235,11 @@ class DownloadManager:
             'DNT': '1',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
-            **self.config.custom_headers,
-            **self.auth_headers
+            **self.config.custom_headers
         }
+        
+        # Apply authentication strategy headers (will be applied per request)
+        session_headers = base_headers.copy()
         
         # Create cookie jar if not exists
         if not self.session_cookies:
@@ -195,6 +300,25 @@ class DownloadManager:
     async def _download_single_url(self, session: aiohttp.ClientSession, 
                                  url: str, output_dir: Path) -> DownloadResult:
         """Download a single URL with aggressive retry logic and memory management."""
+        # Notify download started
+        await self.progress_subject.notify_download_started(url)
+        
+        # Validate hostname to prevent DNS rebinding attacks
+        parsed_url = urlparse(url)
+        hostname = parsed_url.hostname
+        
+        if hostname and not hostname.replace('.', '').isdigit():  # Not an IP address
+            is_valid = await self.dns_validator.resolve_and_validate(hostname)
+            if not is_valid:
+                self.logger.warning(f"Blocked URL {url} - resolves to private/reserved IP")
+                error = "URL resolves to private/reserved IP address"
+                await self.progress_subject.notify_download_failed(url, error)
+                return DownloadResult(
+                    url=url,
+                    success=False,
+                    error=error
+                )
+        
         for attempt in range(self.config.max_retries + 1):
             try:
                 # Advanced rate limiting
@@ -223,7 +347,13 @@ class DownloadManager:
                     total=self.config.read_timeout * (attempt + 1)
                 )
                 
-                async with session.get(url, allow_redirects=self.config.follow_redirects, timeout=timeout) as response:
+                # Apply authentication strategy for this request
+                auth_headers = await self.auth_strategy.apply(session, url)
+                request_headers = {}
+                if auth_headers:
+                    request_headers.update(auth_headers)
+                
+                async with session.get(url, headers=request_headers, allow_redirects=self.config.follow_redirects, timeout=timeout) as response:
                     
                     # Check if we should download this file
                     content_length = response.headers.get('content-length')
@@ -326,13 +456,15 @@ class DownloadManager:
                             continue
                         return DownloadResult(url=url, success=False, error=error_msg)
                     
-                    return DownloadResult(
+                    result = DownloadResult(
                         url=url,
                         success=True,
                         local_path=local_path,
                         file_size=downloaded_size,
                         content_type=content_type
                     )
+                    await self.progress_subject.notify_download_completed(url, downloaded_size)
+                    return result
                     
             except asyncio.TimeoutError:
                 error_msg = f"Download timeout (attempt {attempt + 1})"
@@ -355,19 +487,26 @@ class DownloadManager:
         """Apply rate limiting between requests (legacy method)."""
         await self.rate_limiter.wait_if_needed()
     
+    def set_authentication_strategy(self, strategy: AuthStrategy):
+        """Set authentication strategy for protected sites."""
+        self.auth_strategy = strategy
+        self.session_cookies = strategy.get_cookies()
+        self.logger.info(f"Authentication strategy configured: {type(strategy).__name__}")
+    
     def set_authentication(self, auth_type: str = 'basic', username: str = '', password: str = '', 
                           token: str = '', custom_headers: Dict[str, str] = None):
-        """Set authentication credentials for protected sites."""
-        if auth_type == 'basic' and username and password:
-            import base64
-            credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-            self.auth_headers['Authorization'] = f'Basic {credentials}'
-        elif auth_type == 'bearer' and token:
-            self.auth_headers['Authorization'] = f'Bearer {token}'
-        elif auth_type == 'custom' and custom_headers:
-            self.auth_headers.update(custom_headers)
+        """Set authentication credentials for protected sites (legacy method)."""
+        config = {"type": auth_type}
         
-        self.logger.info(f"Authentication configured: {auth_type}")
+        if auth_type == 'basic':
+            config.update({"username": username, "password": password})
+        elif auth_type == 'bearer':
+            config.update({"token": token})
+        elif auth_type == 'custom':
+            config.update({"headers": custom_headers or {}})
+        
+        strategy = AuthStrategyFactory.create_from_config(config)
+        self.set_authentication_strategy(strategy)
     
     def add_session_cookie(self, name: str, value: str, domain: str, path: str = '/'):
         """Add a session cookie for authentication."""
@@ -511,8 +650,9 @@ class DownloadManager:
             if not raw_data:
                 return None
             
-            # Detect encoding
-            detected = chardet.detect(raw_data)
+            # Run chardet in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            detected = await loop.run_in_executor(None, chardet.detect, raw_data)
             encoding = detected.get('encoding', 'utf-8')
             confidence = detected.get('confidence', 0)
             
@@ -596,3 +736,8 @@ class RateLimiter:
                 await asyncio.sleep(sleep_time)
         
         self.request_times.append(time.time())
+    
+    def cleanup(self):
+        """Cleanup DownloadManager resources."""
+        if hasattr(self, 'dns_validator'):
+            self.dns_validator.close()

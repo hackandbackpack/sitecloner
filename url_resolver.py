@@ -221,10 +221,17 @@ class URLResolver:
             # URL decode the path first
             decoded_path = unquote(parsed.path)
             
+            # Pre-process to prevent Unicode attacks
+            decoded_path = decoded_path.replace('\x00', '').replace('\x0a', '').replace('\x0d', '')
+            
             # Split and sanitize each component
             path_components = [comp for comp in decoded_path.split('/') if comp]
             
             for comp in path_components:
+                # Additional pre-sanitization to catch edge cases
+                if '..' in comp or '\\' in comp or '\x00' in comp:
+                    continue  # Skip dangerous components entirely
+                    
                 sanitized_comp = self._secure_sanitize_filename(comp)
                 if sanitized_comp and sanitized_comp not in ['.', '..']:
                     path_parts.append(sanitized_comp)
@@ -284,11 +291,16 @@ class URLResolver:
         if not filename:
             return 'unnamed'
         
-        # Normalize Unicode characters to prevent homograph attacks
+        # CRITICAL: Remove path traversal attempts BEFORE Unicode normalization
+        # This prevents Unicode bypass attacks
+        filename = filename.replace('..', '_').replace('/', '_').replace('\\', '_')
+        filename = filename.replace('\x00', '').replace('\x0a', '').replace('\x0d', '')
+        
+        # Normalize Unicode characters AFTER removing dangerous sequences
         filename = unicodedata.normalize('NFKC', filename)
         
-        # Remove null bytes and other dangerous characters
-        filename = filename.replace('\x00', '').replace('\x0a', '').replace('\x0d', '')
+        # Second pass: Remove any dangerous characters that might have appeared after normalization
+        filename = filename.replace('..', '_').replace('/', '_').replace('\\', '_')
         
         # Remove/replace problematic characters with strict whitelist approach
         # Allow only alphanumeric, dots, hyphens, underscores, and spaces
@@ -296,9 +308,6 @@ class URLResolver:
         
         # Remove control characters
         sanitized = re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
-        
-        # Remove path traversal attempts
-        sanitized = sanitized.replace('..', '_').replace('/', '_').replace('\\', '_')
         
         # Remove leading/trailing dots and spaces
         sanitized = sanitized.strip('. ')
