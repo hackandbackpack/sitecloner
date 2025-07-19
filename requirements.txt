@@ -1,0 +1,13 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+tinycss2>=1.2.0
+tqdm>=4.65.0
+aiohttp>=3.8.0
+aiofiles>=23.0.0
+python-magic>=0.4.27
+colorama>=0.4.6
+click>=8.1.0
+pathvalidate>=3.1.0
+chardet>=5.0.0
+psutil>=5.9.0
